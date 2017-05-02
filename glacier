@@ -1,0 +1,264 @@
+#!/usr/bin/env python3
+
+import argparse
+import boto.glacier.layer1
+import hashlib
+import iso8601
+import json
+import os
+import os.path
+import pickle
+import sys
+import time
+
+ABORT, DELETE, INVENTORY, TREEHASH, UPLOAD = range(5)
+
+def parse_args():
+  parser = argparse.ArgumentParser()
+  subparsers = parser.add_subparsers(title = 'modes')
+  abort = subparsers.add_parser('abort')
+  delete = subparsers.add_parser('delete')
+  inventory = subparsers.add_parser('inventory')
+  treehash = subparsers.add_parser('treehash')
+  upload = subparsers.add_parser('upload')
+  for p in [abort, delete, inventory, upload]:
+    p.add_argument('-k', '--aws-access-key-id', required = True)
+    p.add_argument('-s', '--aws-secret-access-key', required = True)
+    p.add_argument('-v', '--vault-name', required = True)
+    p.add_argument('-q', '--quiet', action = 'store_true',
+                   help = 'silence information messages')
+  for p in [abort, treehash, upload]:
+    p.add_argument('file')
+  abort.set_defaults(mode = ABORT)
+  delete.set_defaults(mode = DELETE)
+  delete.add_argument('-a', '--archive-id', required = True)
+  inventory.set_defaults(mode = INVENTORY)
+  inventory.add_argument('-f', '--force', action = 'store_true',
+                         help = 'force a new inventory')
+  treehash.set_defaults(mode = TREEHASH)
+  upload.set_defaults(mode = UPLOAD)
+  upload.add_argument('-p', '--part-size', type = int)
+  return parser.parse_args()
+args = parse_args()
+
+def info(*pargs, **kwargs):
+  if not args.quiet:
+    print(*pargs, **kwargs)
+
+def gp2(x):
+  '''The greatest power of two inferior to x
+
+  >>> gp2(1023)
+  512
+  >>> gp2(1024)
+  512
+  >>> gp2(1025)
+  1024
+  '''
+  import math
+  return 2 ** (math.trunc(math.log(x - 1, 2)))
+
+def p2(x):
+  '''Whether x is a power of 2.
+  >>> p2(1023)
+  False
+  >>> p2(1024)
+  True
+  >>> p2(1025)
+  False
+  '''
+  return x and not x & (x - 1)
+
+def tree_hash(f, start, end, depth = 0):
+  chunk_size = 1024 * 1024
+  size = end - start
+  if size <= chunk_size:
+    if isinstance(f, bytes):
+      return hashlib.sha256(f[start:end])
+    else:
+      f.seek(start)
+      chunk = f.read(size)
+    return hashlib.sha256(chunk)
+  split = start + gp2(size)
+  lhs = tree_hash(f, start, split, depth + 1)
+  rhs = tree_hash(f, split, end, depth + 1)
+  return hashlib.sha256(lhs.digest() + rhs.digest())
+
+class State(dict):
+
+  def __init__(self, p):
+    path = list(os.path.split(p))
+    path[-1] = '.{}.glacier-upload'.format(path[-1])
+    self.__path = os.path.join(*path)
+    try:
+      with open(self.__path, 'rb') as f:
+        self.update(pickle.load(f))
+    except FileNotFoundError:
+      pass
+
+  def save(self):
+    with open(self.__path, 'wb') as f:
+      pickle.dump(dict(self), f)
+
+  def remove(self):
+    try:
+      os.remove(self.__path)
+    except FileNotFoundError:
+      pass
+
+def glacier():
+  return boto.glacier.layer1.Layer1(
+    aws_access_key_id = args.aws_access_key_id,
+    aws_secret_access_key = args.aws_secret_access_key)
+
+if args.mode == UPLOAD:
+  g = glacier()
+  state = State(args.file)
+  size = os.stat(args.file).st_size
+  if size < 10000:
+    minimum_part_size = 1
+  else:
+    minimum_part_size = gp2(size / 10000) * 2
+  if 'part-size' in state:
+    part_size = state['part-size']
+    if args.part_size is not None and arg.part_size != part_size:
+      raise Exception('part size is already set '
+                      'for this transfer: {}'.format(part_size))
+  else:
+    if args.part_size is not None:
+      part_size = args.part_size
+    else:
+      part_size = max(minimum_part_size, 1024 * 1024)
+    state['part-size'] = part_size
+  if part_size < minimum_part_size:
+    raise Exception('the selected part size result in more than '
+                    '10000 parts, which glacier forbids. '
+                    'Pick at leaste {}.'.format(minimum_part_size))
+  if not p2(part_size):
+    raise Exception('part size is not a power of 2, '
+                    'which glacier forbids')
+  state.save()
+
+  if 'upload-id' not in state:
+    info('Initiate upload: ', end = '')
+    sys.stdout.flush()
+    r = g.initiate_multipart_upload(vault_name = args.vault_name,
+                                    part_size = part_size,
+                                    description = args.file)
+    state['upload-id'] = r['UploadId']
+    state.save()
+    info(state['upload-id'])
+
+  chunk = state.get('chunk', 0)
+
+  with open(args.file, 'rb') as f:
+    done = False
+    while not done:
+      start = chunk * part_size
+      end = (chunk + 1) * part_size
+      if start >= size:
+        done = True
+        break
+      if end > size:
+        end = size
+        done = True
+      info('Upload chunk {}'.format(chunk))
+      f.seek(start)
+      data = f.read(part_size)
+      linear_hash = hashlib.sha256(data).hexdigest()
+      assert end - start == len(data)
+      r = g.upload_part(
+        vault_name = args.vault_name,
+        upload_id = state['upload-id'],
+        byte_range = (start, end - 1),
+        part_data = data,
+        linear_hash = linear_hash,
+        tree_hash = tree_hash(data, 0, len(data)).hexdigest())
+      # FIXME: If we don't do this, boto keeps all connection open in
+      # a pool, `hitting ulimit -n`.
+      r.http_response.close()
+      chunk += 1
+      state['chunk'] = chunk
+      state.save()
+    # FIXME: We could probably compute the tree hash on the fly,
+    # combining hashes as we upload parts and saving intermediate
+    # results to the state. Good enough for now.
+    thash = state.get('tree_hash')
+    if thash is None:
+      info('Compute tree hash: ', end = '')
+      sys.stdout.flush()
+      thash = tree_hash(f, 0, size).hexdigest()
+      state['tree_hash'] = thash
+      state.save()
+      info(thash)
+    archive = state.get('archive_id')
+    if archive is None:
+      r = g.complete_multipart_upload(
+        vault_name = args.vault_name,
+        upload_id = state['upload-id'],
+        sha256_treehash = thash,
+        archive_size = size)
+      archive = r['ArchiveId']
+      state['archive_id'] = archive
+      state.save()
+    info('Archive id:', archive)
+elif args.mode == INVENTORY:
+  g = glacier()
+  job_id = None
+  creation_date = None
+  d = {'Completed': False}
+  if not args.force:
+    # Check for existing inventory job
+    for job in g.list_jobs(vault_name = args.vault_name)['JobList']:
+      if job['Action'] == 'InventoryRetrieval':
+        start = iso8601.parse_date(job['CreationDate'])
+        if job_id is None or \
+              start > creation_date and \
+              (job['Completed'] or not d['Completed']):
+          creation_date = start
+          job_id = job['JobId']
+          d['Completed'] = job['Completed']
+  # If none, start a new one
+  if job_id is None:
+    job = g.initiate_job(
+      vault_name = args.vault_name,
+      job_data = {
+        'Format': 'JSON',
+        'Type': 'inventory-retrieval',
+        })
+    job_id = job['JobId']
+    info('Start inventory:', job_id)
+  else:
+    info('Retreive previous inventory:', job_id)
+  # Wait for job completion
+  while not d['Completed']:
+    try:
+      time.sleep(10)
+      d = g.describe_job(vault_name = args.vault_name,
+                         job_id = job_id)
+    except boto.glacier.exceptions.UnexpectedHTTPResponseError as e:
+      if e.status == 400:
+        body = json.loads(e.body.decode('latin-1'))
+        if body['code'] == 'ThrottlingException':
+          continue
+      raise
+  # Retrieve result
+  output = g.get_job_output(vault_name = args.vault_name,
+                            job_id = job_id)
+  json.dump(output, fp = sys.stdout)
+elif args.mode == ABORT:
+  g = glacier()
+  state = State(args.file)
+  if 'upload-id' in state:
+    info('Abort upload:', state['upload_id'])
+    g.abort_multipart_upload(vault_name = args.vault_name,
+                             upload_id = state['upload-id'])
+  state.remove()
+elif args.mode == TREEHASH:
+  with open(args.file, 'rb') as f:
+    print(tree_hash(f, 0, os.stat(args.file).st_size).hexdigest())
+elif args.mode == DELETE:
+  g = glacier()
+  info('Delete archive:', args.archive_id)
+  g.delete_archive(vault_name = args.vault_name,
+                   archive_id = args.archive_id)
